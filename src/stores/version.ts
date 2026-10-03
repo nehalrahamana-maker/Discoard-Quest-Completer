@@ -51,7 +51,10 @@ export const useVersionStore = defineStore('version', () => {
     const checkPreRelease = ref(localStorage.getItem('checkPreRelease') === 'true')
     
     // Auto-update configuration
-    const githubRepo = ref<string>(localStorage.getItem('githubRepo') || 'nehalrahamana-maker/Discoard-Quest-Completer')
+    const savedRepo = localStorage.getItem('githubRepo')
+    const initialRepo = (savedRepo && !savedRepo.toLowerCase().includes('masterain')) ? savedRepo : 'nehalrahamana-maker/Discoard-Quest-Completer'
+    const githubRepo = ref<string>(initialRepo)
+    localStorage.setItem('githubRepo', initialRepo)
     const autoCheckUpdates = ref<boolean>(localStorage.getItem('autoCheckUpdates') !== 'false')
     const autoDownloadUpdates = ref<boolean>(localStorage.getItem('autoDownloadUpdates') === 'true')
     
@@ -117,29 +120,20 @@ export const useVersionStore = defineStore('version', () => {
         updateStatus.value = 'checking'
 
         try {
-            const repo = githubRepo.value.trim() || 'nehalrahamana-maker/Discoard-Quest-Completer'
+            const repo = (githubRepo.value.trim() && !githubRepo.value.toLowerCase().includes('masterain'))
+                ? githubRepo.value.trim()
+                : 'nehalrahamana-maker/Discoard-Quest-Completer'
+            githubRepo.value = repo
+
             const url = checkPreRelease.value
               ? `https://api.github.com/repos/${repo}/releases`
               : `https://api.github.com/repos/${repo}/releases/latest`
 
-            let res = await fetch(url, {
+            const res = await fetch(url, {
                 headers: {
                     'Accept': 'application/vnd.github.v3+json'
                 }
             })
-
-            // If the custom fork hasn't created a release yet, fall back to upstream release
-            if (res.status === 404 && repo !== 'Masterain98/discord-quest-helper') {
-                const fallbackUrl = checkPreRelease.value
-                  ? `https://api.github.com/repos/Masterain98/discord-quest-helper/releases`
-                  : `https://api.github.com/repos/Masterain98/discord-quest-helper/releases/latest`
-                const fallbackRes = await fetch(fallbackUrl, {
-                    headers: { 'Accept': 'application/vnd.github.v3+json' }
-                })
-                if (fallbackRes.ok) {
-                    res = fallbackRes
-                }
-            }
 
             if (!res.ok) {
                 throw new Error(`GitHub API returned ${res.status}`)

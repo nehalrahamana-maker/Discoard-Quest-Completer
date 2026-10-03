@@ -10,10 +10,9 @@ echo ===================================================
 echo.
 
 set "REPO=nehalrahamana-maker/Discoard-Quest-Completer"
-set "FALLBACK_REPO=Masterain98/discord-quest-helper"
 
 echo [*] Checking GitHub for updates from %REPO%...
-for /f "tokens=*" %%a in ('powershell -NoProfile -Command "try { (Invoke-RestMethod -Uri 'https://api.github.com/repos/%REPO%/releases/latest' -Headers @{'User-Agent'='Nehal-Quest-Helper'}).tag_name } catch { try { (Invoke-RestMethod -Uri 'https://api.github.com/repos/%FALLBACK_REPO%/releases/latest' -Headers @{'User-Agent'='Nehal-Quest-Helper'}).tag_name } catch { '' } }" 2^>nul') do (
+for /f "tokens=*" %%a in ('powershell -NoProfile -Command "try { (Invoke-RestMethod -Uri 'https://api.github.com/repos/%REPO%/releases/latest' -Headers @{'User-Agent'='Nehal-Quest-Helper'}).tag_name } catch { '' }" 2^>nul') do (
     set "LATEST_TAG=%%a"
 )
 
@@ -23,7 +22,7 @@ if defined LATEST_TAG if not "!LATEST_TAG!"=="" (
         echo !LATEST_TAG! > "version.txt"
     )
     set /p CURRENT_TAG=<"version.txt"
-    if not exist "Nehal-Quest-Helper.exe" (
+    if not exist "nehal.exe" (
         set "NEED_UPDATE=1"
     ) else if "!CURRENT_TAG!" neq "!LATEST_TAG!" (
         echo [*] New version detected: !CURRENT_TAG! -^> !LATEST_TAG!
@@ -36,13 +35,14 @@ if defined LATEST_TAG if not "!LATEST_TAG!"=="" (
         echo [*] Downloading latest release (!LATEST_TAG!)...
         curl.exe -L -o "portable.zip" "https://github.com/%REPO%/releases/download/!LATEST_TAG!/discord-quest-helper-Windows-x64-!LATEST_TAG!-portable.zip" 2>nul
         if not exist "portable.zip" (
-            curl.exe -L -o "portable.zip" "https://github.com/%FALLBACK_REPO%/releases/download/!LATEST_TAG!/discord-quest-helper-Windows-x64-!LATEST_TAG!-portable.zip"
+            curl.exe -L -o "portable.zip" "https://github.com/%REPO%/releases/download/!LATEST_TAG!/Nehal-Quest-Helper-!LATEST_TAG!-Windows.zip" 2>nul
         )
         if exist "portable.zip" (
             echo [*] Extracting update files...
             tar.exe -xf "portable.zip"
             if exist "discord-quest-helper.exe" (
-                copy /y "discord-quest-helper.exe" "Nehal-Quest-Helper.exe" >nul
+                copy /y "discord-quest-helper.exe" "nehal.exe" >nul
+                del /f /q "discord-quest-helper.exe" >nul 2>nul
             )
             del /f /q "portable.zip" >nul 2>nul
             echo !LATEST_TAG! > "version.txt"
@@ -50,20 +50,14 @@ if defined LATEST_TAG if not "!LATEST_TAG!"=="" (
         )
     )
 ) else (
-    echo [!] Could not check GitHub API. Launching local version...
+    echo [!] Offline or GitHub API rate limit reached. Launching local version...
 )
 
-if exist "Nehal-Quest-Helper.exe" (
-    echo [*] Launching Nehal-Quest-Helper.exe...
-    start "" "Nehal-Quest-Helper.exe"
-) else if exist "nehal.exe" (
+if exist "nehal.exe" (
     echo [*] Launching nehal.exe...
     start "" "nehal.exe"
-) else if exist "discord-quest-helper.exe" (
-    echo [*] Launching discord-quest-helper.exe...
-    start "" "discord-quest-helper.exe"
 ) else (
-    echo [!] Executable not found!
+    echo [!] nehal.exe not found!
     pause
 )
 exit /b 0
