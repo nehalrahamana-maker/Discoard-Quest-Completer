@@ -1,0 +1,1525 @@
+import { defineStore } from 'pinia'
+import { ref, watch } from 'vue'
+import type { Quest, DetectableGame, DesktopClientArg, ExcludedQuest, GameQuestMode, PlatformCapabilities } from '@/api/tauri'
+import { getQuestKind, playActivityProgressPercentage } from '@/utils/questTasks'
+import { resolveSimulationExecutable } from '@/utils/executables'
+
+/** Quest with optional pre-selected executable name for batch game quest processing */
+interface QueueItem extends Quest {
+  selectedExeName?: string
+}
+
+/**
+ * A recoverable, non-fatal quest condition surfaced to the UI.
+ *
+ * Unlike a thrown Error, a soft error does not abort the queue or read as a
+ * system failure — it drives a dialog that can steer the user to a working mode
+ * (e.g. CDP) without losing quest context.
+ */
+export interface QuestSoftError {
+  code: 'SIMULATION_EXECUTABLE_OS_UNSUPPORTED' | 'SIMULATION_EXECUTABLE_NOT_FOUND'
+  /** English fallback message; the UI localizes by `code` using `gameName`. */
+  message: string
+  /** Detectable-game name, so the dialog can render a localized message. */
+  gameName: string
+  questId: string
+  recommendedMode?: 'cdp'
+  recoverable: true
+}
+
+/** Why the quest queue is currently paused. */
+export type QueuePauseReason =
+  | 'user'
+  | 'simulation_incompatible'
+  | 'cdp_restart_required'
+  | 'authentication_required'
+import {
+  getQuestsFull,
+  startVideoQuest,
+  startStreamQuest,
+  stopQuest,
+  onQuestProgress,
+  onQuestComplete,
+  onQuestError,
+  createSimulatedGame,
+  runSimulatedGame,
+  stopSimulatedGame,
+  fetchDetectableGames,
+  connectToDiscordRpc,
+  acceptQuest,
+  startGameHeartbeatQuest,
+  startPlayActivityQuest,
+  forceVideoProgress,
+  startCdpQuest,
+  checkCdpStatus,
+  getVirtualCurrencyBalance,
+  getPlatformCapabilities,
+  startGameSimulationUsage,
+  stopGameSimulationUsage,
+} from '@/api/tauri'
+import { appLocalDataDir, join } from '@tauri-apps/api/path'
+import { emit } from '@tauri-apps/api/event'
+
+
+// localStorage keys
+const STORAGE_SPEED_KEY = 'questHelper_speedMultiplier'
+const STORAGE_SIMULATION_PATH_KEY = 'questHelper_simulationPath'
+
+export const useQuestsStore = defineStore('quests', () => {
+  const quests = ref<Quest[]>([])
+  const excludedQuests = ref<ExcludedQuest[]>([])
+  const questEnrollmentBlockedUntil = ref<string | null>(null)
+  const lastQuestsFetchTime = ref(0)
+  const loading = ref(false)
+  const stopping = ref(false)
+  const error = ref<string | null>(null)
+  const orbsBalance = ref<number | null>(null)
+  const orbsBalanceFetchedAt = ref<string | null>(null)
+  const orbsBalanceLoading = ref(false)
+  const orbsBalanceError = ref<string | null>(null)
+
+  // Single source of truth for every process-simulation entry point. The
+  // asynchronous default is resolved lazily by initSimulationPath().
+  const simulationPath = ref(localStorage.getItem(STORAGE_SIMULATION_PATH_KEY) ?? '')
+  let simulationPathRevision = 0
+
+  const activeQuestId = ref<string | null>(null)
+  const activeQuestType = ref<'video' | 'stream' | 'game' | 'activity' | null>(null)
+  const activeQuestProgress = ref(0)
+  const activeQuestTargetDuration = ref(0)
+
+  // Local Progress Simulation State
+  const localProgress = ref(0)
+  const activeGameExe = ref<string | null>(null)
+
+  // Speed multiplier - read from localStorage, default 1, range 0.1 - 2.0
+  const savedSpeed = localStorage.getItem(STORAGE_SPEED_KEY)
+  let initialSpeed = savedSpeed ? parseFloat(savedSpeed) : 1.0
+  // Validate range (0.1 to 2.0)
+  if (isNaN(initialSpeed) || initialSpeed < 0.1 || initialSpeed > 2.0) {
+    initialSpeed = 1.0
+  }
+  const speedMultiplier = ref(initialSpeed)
+
+  // Heartbeat interval (seconds) - for Video quests API heartbeat requests
+  const STORAGE_INTERVAL_KEY = 'questHelper_heartbeatInterval'
+  const savedInterval = localStorage.getItem(STORAGE_INTERVAL_KEY)
+  let initialInterval = savedInterval ? parseInt(savedInterval) : 15
+  // Validate range (10 to 30)
+  if (isNaN(initialInterval) || initialInterval < 10 || initialInterval > 30) {
+    initialInterval = 15
+  }
+  const heartbeatInterval = ref(initialInterval)
+
+  // Game polling interval (seconds) - for Play/Game quests progress detection
+  const STORAGE_GAME_POLLING_KEY = 'questHelper_gamePollingInterval'
+  const savedGamePolling = localStorage.getItem(STORAGE_GAME_POLLING_KEY)
+  let initialGamePolling = savedGamePolling ? parseInt(savedGamePolling) : 120
+  // Validate range (30 to 300)
+  if (isNaN(initialGamePolling) || initialGamePolling < 30 || initialGamePolling > 300) {
+    initialGamePolling = 120
+  }
+  const gamePollingInterval = ref(initialGamePolling)
+
+  // Game Quest Mode - 'simulate' runs a fake game exe, 'heartbeat' sends direct API heartbeats, 'cdp' injects via CDP
+  const STORAGE_GAME_QUEST_MODE_KEY = 'questHelper_gameQuestMode'
+  const savedGameQuestMode = localStorage.getItem(STORAGE_GAME_QUEST_MODE_KEY)
+  const gameQuestMode = ref<GameQuestMode>(
+    savedGameQuestMode === 'heartbeat' ? 'heartbeat'
+    : savedGameQuestMode === 'cdp' ? 'cdp'
+    : 'simulate'
+  )
+
+  // Read-only platform capability descriptor (loaded once from the backend).
+  const platformCapabilities = ref<PlatformCapabilities | null>(null)
+  // True once the first load attempt has settled (success or failure), so the UI
+  // can avoid rendering platform-dependent affordances against a null descriptor.
+  const platformCapabilitiesReady = ref(false)
+  // In-flight load, so the fire-and-forget call at store creation and the
+  // awaiting callers (startPlay, the Home pre-selection flows) share one fetch.
+  let platformCapabilitiesInFlight: Promise<PlatformCapabilities | null> | null = null
+
+  /**
+   * Load the platform capability descriptor. On first run (no saved mode) this
+   * applies the platform's default Play-Quest mode — 'cdp' on Linux, 'simulate'
+   * on Windows/macOS — without ever overriding a preference the user has set.
+   * Safe to call more than once and from several callers concurrently; only the
+   * first call fetches, and later ones resolve from the cached descriptor.
+   */
+  async function initPlatformCapabilities(): Promise<PlatformCapabilities | null> {
+    if (platformCapabilities.value) return platformCapabilities.value
+    if (platformCapabilitiesInFlight) return platformCapabilitiesInFlight
+
+    platformCapabilitiesInFlight = (async () => {
+      try {
+        const caps = await getPlatformCapabilities()
+        platformCapabilities.value = caps
+        // Re-read at resolve time rather than trusting `savedGameQuestMode`,
+        // which is a store-setup snapshot. If the user picked a mode from
+        // Settings while this fetch was in flight, the `gameQuestMode` watcher
+        // has already persisted it, and applying the platform default here
+        // would silently clobber that fresh choice.
+        const currentSavedMode = localStorage.getItem(STORAGE_GAME_QUEST_MODE_KEY)
+        if (
+          currentSavedMode === null &&
+          (caps.defaultGameQuestMode === 'simulate' ||
+            caps.defaultGameQuestMode === 'heartbeat' ||
+            caps.defaultGameQuestMode === 'cdp')
+        ) {
+          gameQuestMode.value = caps.defaultGameQuestMode
+        }
+        return caps
+      } catch (error) {
+        console.warn('Failed to load platform capabilities:', error)
+        return null
+      } finally {
+        platformCapabilitiesReady.value = true
+        platformCapabilitiesInFlight = null
+      }
+    })()
+
+    return platformCapabilitiesInFlight
+  }
+
+  // Recoverable soft error (e.g. win32-only game on Linux simulate mode) that
+  // the UI surfaces as an actionable dialog rather than a fatal error.
+  const softError = ref<QuestSoftError | null>(null)
+  const queuePauseReason = ref<QueuePauseReason | null>(null)
+  // Remember the last Play-Quest request so "switch to CDP and retry" can resume it.
+  const lastPlayRequest = ref<{ quest: Quest; secondsNeeded: number; initialProgress: number; selectedExeName?: string } | null>(null)
+
+  // CDP availability status
+  const cdpAvailable = ref(false)
+
+  // CDP Port - default 9223, user configurable
+  const STORAGE_CDP_PORT_KEY = 'questHelper_cdpPort'
+  const savedCdpPort = localStorage.getItem(STORAGE_CDP_PORT_KEY)
+  const cdpPort = ref(savedCdpPort ? parseInt(savedCdpPort) : 9223)
+
+  const STORAGE_DESKTOP_CLIENT_KEY = 'questHelper_desktopClient'
+  const savedDesktopClient = localStorage.getItem(STORAGE_DESKTOP_CLIENT_KEY)
+  const desktopClient = ref<DesktopClientArg>(
+    savedDesktopClient === 'official' || savedDesktopClient === 'vesktop' || savedDesktopClient === 'auto'
+      ? savedDesktopClient
+      : 'auto',
+  )
+
+  // Optional display: account Orbs balance. Disabled by default to avoid extra requests.
+  const STORAGE_SHOW_ORBS_BALANCE_KEY = 'questHelper_showOrbsBalance'
+  const savedShowOrbsBalance = localStorage.getItem(STORAGE_SHOW_ORBS_BALANCE_KEY)
+  const showOrbsBalance = ref(savedShowOrbsBalance === null ? true : savedShowOrbsBalance === 'true')
+
+  async function getDefaultSimulationPath(): Promise<string> {
+    try {
+      const base = await appLocalDataDir()
+      return await join(base, 'GameRuntime')
+    } catch {
+      throw new Error('Failed to resolve the default game simulation directory.')
+    }
+  }
+
+  async function initSimulationPath(): Promise<string> {
+    const configuredPath = simulationPath.value
+    if (configuredPath.trim()) {
+      return configuredPath
+    }
+
+    const defaultPath = await getDefaultSimulationPath()
+
+    // Do not overwrite a path selected while the asynchronous Tauri calls
+    // above were in flight.
+    const latestConfiguredPath = simulationPath.value
+    if (latestConfiguredPath.trim()) return latestConfiguredPath
+
+    simulationPath.value = defaultPath
+    return defaultPath
+  }
+
+  function setSimulationPath(path: string): void {
+    if (!path.trim()) {
+      throw new Error('Simulation path cannot be empty')
+    }
+    simulationPathRevision += 1
+    simulationPath.value = path
+  }
+
+  async function resetSimulationPath(): Promise<string> {
+    const revisionBeforeReset = simulationPathRevision
+    const defaultPath = await getDefaultSimulationPath()
+
+    // A later directory selection wins over this in-flight reset.
+    if (simulationPathRevision !== revisionBeforeReset && simulationPath.value.trim()) {
+      return simulationPath.value
+    }
+
+    simulationPathRevision += 1
+    simulationPath.value = defaultPath
+    return defaultPath
+  }
+
+  // Activity quest checkpoint interval (seconds) - min/max time between checkpoints
+  const STORAGE_ACTIVITY_CHECKPOINT_MIN_KEY = 'questHelper_activityCheckpointMin'
+  const savedCheckpointMin = localStorage.getItem(STORAGE_ACTIVITY_CHECKPOINT_MIN_KEY)
+  let initialCheckpointMin = savedCheckpointMin ? parseInt(savedCheckpointMin) : 180
+  if (isNaN(initialCheckpointMin) || initialCheckpointMin < 30 || initialCheckpointMin > 600) {
+    initialCheckpointMin = 180
+  }
+  const activityCheckpointMin = ref(initialCheckpointMin)
+
+  const STORAGE_ACTIVITY_CHECKPOINT_MAX_KEY = 'questHelper_activityCheckpointMax'
+  const savedCheckpointMax = localStorage.getItem(STORAGE_ACTIVITY_CHECKPOINT_MAX_KEY)
+  let initialCheckpointMax = savedCheckpointMax ? parseInt(savedCheckpointMax) : 300
+  if (isNaN(initialCheckpointMax) || initialCheckpointMax < 60 || initialCheckpointMax > 900) {
+    initialCheckpointMax = 300
+  }
+  const activityCheckpointMax = ref(initialCheckpointMax)
+
+  // Persist speed changes to localStorage
+  watch(speedMultiplier, (newSpeed) => {
+    localStorage.setItem(STORAGE_SPEED_KEY, String(newSpeed))
+  })
+
+  // Persist heartbeat interval changes
+  watch(heartbeatInterval, (newInterval) => {
+    localStorage.setItem(STORAGE_INTERVAL_KEY, String(newInterval))
+  })
+
+  // Persist game polling interval changes
+  watch(gamePollingInterval, (newInterval) => {
+    localStorage.setItem(STORAGE_GAME_POLLING_KEY, String(newInterval))
+  })
+
+  // Persist game quest mode changes
+  watch(gameQuestMode, (newMode) => {
+    localStorage.setItem(STORAGE_GAME_QUEST_MODE_KEY, newMode)
+  })
+
+  // Persist CDP port changes
+  watch(cdpPort, (newPort) => {
+    localStorage.setItem(STORAGE_CDP_PORT_KEY, String(newPort))
+  })
+
+  watch(desktopClient, (client) => {
+    localStorage.setItem(STORAGE_DESKTOP_CLIENT_KEY, client)
+  })
+
+  watch(showOrbsBalance, (enabled) => {
+    localStorage.setItem(STORAGE_SHOW_ORBS_BALANCE_KEY, String(enabled))
+    if (enabled && orbsBalance.value == null) {
+      fetchOrbsBalance().catch(err => {
+        console.warn('Background Orbs balance fetch failed:', err)
+      })
+    }
+  })
+
+  watch(simulationPath, (path) => {
+    if (path.trim()) {
+      localStorage.setItem(STORAGE_SIMULATION_PATH_KEY, path)
+    }
+  }, { flush: 'sync' })
+
+  function normalizeCheckpoint(value: number, fallback: number, min: number, max: number): number {
+    if (!Number.isFinite(value)) return fallback
+    const n = Math.round(value)
+    return Math.min(max, Math.max(min, n))
+  }
+
+  // Persist activity checkpoint interval changes
+  watch(activityCheckpointMin, (newMin) => {
+    const normalizedMin = normalizeCheckpoint(newMin, 180, 30, 600)
+    if (normalizedMin !== newMin) {
+      activityCheckpointMin.value = normalizedMin
+      return
+    }
+    localStorage.setItem(STORAGE_ACTIVITY_CHECKPOINT_MIN_KEY, String(normalizedMin))
+    // Ensure max >= min
+    if (activityCheckpointMax.value < normalizedMin) {
+      activityCheckpointMax.value = normalizedMin
+    }
+  }, { flush: 'sync' })
+
+  watch(activityCheckpointMax, (newMax) => {
+    const normalizedMax = normalizeCheckpoint(newMax, 300, 60, 900)
+    if (normalizedMax !== newMax) {
+      activityCheckpointMax.value = normalizedMax
+      return
+    }
+    localStorage.setItem(STORAGE_ACTIVITY_CHECKPOINT_MAX_KEY, String(normalizedMax))
+    // Ensure min <= max
+    if (activityCheckpointMin.value > normalizedMax) {
+      activityCheckpointMin.value = normalizedMax
+    }
+  }, { flush: 'sync' })
+
+  let progressUnlisten: (() => void) | null = null
+  let completeUnlisten: (() => void) | null = null
+  let errorUnlisten: (() => void) | null = null
+  let pollingTimer: ReturnType<typeof setInterval> | null = null
+  // Guards against overlapping interval callbacks. `setInterval` keeps firing
+  // while an async tick is still awaiting cleanup, and two ticks observing the
+  // same completed queue item would each shift the shared queue and schedule
+  // `processQueue()`, skipping a never-started quest and starting another
+  // concurrently.
+  let pollingInFlight = false
+  // Synchronously claimed by either polling or the completion event before
+  // cleanup so both sources cannot advance the same queue item.
+  let completionClaimedFor: string | null = null
+
+  // Simulation internal vars
+  let simAnimationFrame: number | null = null
+  let simLastTime = 0
+  let simCurrentSpeed = 1.0
+
+  async function fetchQuests(silent = false, force = false) {
+    if (!force && quests.value.length > 0) {
+      const now = Date.now()
+      // 30 minutes cache
+      if (now - lastQuestsFetchTime.value < 30 * 60 * 1000) {
+        console.log('Using cached quests list')
+        return
+      }
+    }
+
+    if (!silent) loading.value = true
+    error.value = null
+    try {
+      console.log('Fetching quests from API...')
+      const response = await getQuestsFull()
+      quests.value = response.quests
+      excludedQuests.value = response.excluded_quests || []
+      questEnrollmentBlockedUntil.value = response.quest_enrollment_blocked_until || null
+      lastQuestsFetchTime.value = Date.now()
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : String(e)
+    } finally {
+      if (!silent) loading.value = false
+    }
+  }
+
+  let orbsFetchGeneration = 0
+
+  async function fetchOrbsBalance(force = false) {
+    const generationAtStart = orbsFetchGeneration
+    if (!showOrbsBalance.value && !force) return
+    if (orbsBalanceLoading.value) return
+    if (!force && orbsBalance.value != null) return
+
+    orbsBalanceLoading.value = true
+    orbsBalanceError.value = null
+    try {
+      const balance = await getVirtualCurrencyBalance()
+      if (generationAtStart !== orbsFetchGeneration) return
+      orbsBalance.value = balance
+      orbsBalanceFetchedAt.value = new Date().toISOString()
+    } catch (e) {
+      if (generationAtStart !== orbsFetchGeneration) return
+      orbsBalanceError.value = e as string
+      throw e
+    } finally {
+      if (generationAtStart === orbsFetchGeneration) {
+        orbsBalanceLoading.value = false
+      }
+    }
+  }
+
+  async function finishQueuedQuest(questId: string) {
+    if (!isQueueRunning.value || questQueue.value[0]?.id !== questId || activeQuestId.value !== questId) return
+    if (completionClaimedFor === questId) return
+    completionClaimedFor = questId
+    const completedExecutable = activeGameExe.value
+    activeQuestId.value = null
+    try {
+      if (completedExecutable && gameQuestMode.value === 'simulate') {
+        await stopSimulatedGame(completedExecutable)
+        await emit('event_disconnect')
+      }
+      await stopGameSimulationUsage()
+    } catch (cleanupError) {
+      // Keep the queue in place until both native activity and its history
+      // segment have been finalized. The user can retry cleanup with Stop.
+      activeQuestId.value = questId
+      error.value = cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+      isQueueRunning.value = false
+      stopProgressSimulation()
+      cleanupListeners()
+      stopPolling()
+      return
+    }
+
+    questQueue.value.shift()
+    activeQuestType.value = null
+    activeQuestProgress.value = 0
+    activeQuestTargetDuration.value = 0
+    activeGameExe.value = null
+    localProgress.value = 0
+    stopProgressSimulation()
+    cleanupListeners()
+    stopPolling()
+    void fetchQuests(true, true)
+    setTimeout(() => {
+      if (isQueueRunning.value) void processQueue()
+    }, 2000)
+  }
+
+  async function checkActiveQuestStatus() {
+    if (!activeQuestId.value) return
+    const quest = quests.value.find(q => q.id === activeQuestId.value)
+    if (!quest) return
+
+    // Check completion
+    if (quest.user_status?.completed_at) {
+      // If queue is running, handle transition to next quest instead of full stop
+      if (isQueueRunning.value && questQueue.value.length > 0) {
+        console.log('Queue item completed detected via polling.')
+        await finishQueuedQuest(quest.id)
+        return
+      }
+
+      console.log('Quest completed detected via polling, stopping game.')
+      if (completionClaimedFor === quest.id) return
+      completionClaimedFor = quest.id
+      await stop()
+      stopPolling()
+      return
+    }
+
+    // Update progress
+    const progressObj = quest.user_status?.progress
+    let currentSeconds = 0
+    if (progressObj && typeof progressObj === 'object') {
+      const vals = Object.values(progressObj as Record<string, { value?: number }>)
+      if (vals.length > 0 && vals[0]?.value) currentSeconds = vals[0].value
+    }
+
+    const target = activeQuestTargetDuration.value
+    if (target > 0) {
+      const pct = (currentSeconds / target) * 100
+      activeQuestProgress.value = pct
+    }
+  }
+
+  function startPolling() {
+    if (pollingTimer) clearInterval(pollingTimer)
+    // Use user-configurable game polling interval (in seconds, convert to ms)
+    const intervalMs = gamePollingInterval.value * 1000
+    pollingTimer = setInterval(async () => {
+      // Serialize ticks: when a previous tick is still awaiting `fetchQuests`
+      // or completion cleanup, skip this one instead of overlapping it.
+      if (pollingInFlight) return
+      pollingInFlight = true
+      try {
+        await fetchQuests(true, true)
+        await checkActiveQuestStatus()
+      } finally {
+        pollingInFlight = false
+      }
+    }, intervalMs)
+  }
+
+  function stopPolling() {
+    if (pollingTimer) {
+      clearInterval(pollingTimer)
+      pollingTimer = null
+    }
+    pollingInFlight = false
+    completionClaimedFor = null
+  }
+
+  // --- Local Progress Simulation ---
+  function startProgressSimulation(speed: number) {
+    stopProgressSimulation() // Clear any existing
+    simCurrentSpeed = speed
+    simLastTime = Date.now()
+    localProgress.value = activeQuestProgress.value
+
+    // Loop
+    const loop = () => {
+      if (!activeQuestId.value || activeQuestProgress.value >= 100) {
+        stopProgressSimulation()
+        return
+      }
+
+      const now = Date.now()
+      const deltaSeconds = (now - simLastTime) / 1000
+      simLastTime = now
+
+      const targetSeconds = activeQuestTargetDuration.value
+      if (targetSeconds > 0) {
+        const addedPercent = (deltaSeconds * simCurrentSpeed / targetSeconds) * 100
+        localProgress.value += addedPercent
+      }
+
+      // Clamp logic:
+      // Always at least activeQuestProgress (blue bar)
+      // Never more than 100
+      localProgress.value = Math.max(localProgress.value, activeQuestProgress.value)
+      localProgress.value = Math.min(localProgress.value, 100)
+
+      simAnimationFrame = requestAnimationFrame(loop)
+    }
+
+    simAnimationFrame = requestAnimationFrame(loop)
+  }
+
+  function stopProgressSimulation() {
+    if (simAnimationFrame !== null) {
+      cancelAnimationFrame(simAnimationFrame)
+      simAnimationFrame = null
+    }
+  }
+
+  // Watch activeQuestProgress to re-anchor local progress
+  // If backend reports new progress (blue bar jumps), update local (green bar) to ensure it's not lagging behind
+  watch(activeQuestProgress, (newVal) => {
+    localProgress.value = Math.max(localProgress.value, newVal)
+  })
+
+  // Update a quest's enrollment status locally (no full refresh)
+  function updateQuestEnrollment(questId: string, enrolledAt: string) {
+    const questIndex = quests.value.findIndex(q => q.id === questId)
+    if (questIndex !== -1) {
+      const quest = quests.value[questIndex]
+      // Create new user_status or update existing one
+      quests.value[questIndex] = {
+        ...quest,
+        user_status: {
+          ...quest.user_status,
+          enrolled_at: enrolledAt,
+          completed_at: quest.user_status?.completed_at || null,
+          claimed_at: quest.user_status?.claimed_at || null,
+          progress: quest.user_status?.progress || {}
+        }
+      }
+    }
+  }
+
+  async function startVideo(questId: string, secondsNeeded: number, initialProgress: number) {
+    try {
+      const progressPct = (secondsNeeded > 0) ? (initialProgress / secondsNeeded) * 100 : 0
+
+      if (gameQuestMode.value === 'cdp') {
+        // CDP mode: use Discord's internal api.post() for video progress
+        await startCdpQuest(questId, 'video', '', '', secondsNeeded, initialProgress, cdpPort.value)
+      } else {
+        console.log(`[startVideo] mode=${gameQuestMode.value} speed=${speedMultiplier.value}x interval=${heartbeatInterval.value}s`)
+        await startVideoQuest(questId, secondsNeeded, progressPct, speedMultiplier.value, heartbeatInterval.value)
+      }
+
+      activeQuestId.value = questId
+      activeQuestType.value = 'video'
+      activeQuestProgress.value = progressPct
+      activeQuestTargetDuration.value = secondsNeeded
+
+      // CDP video progress is server-enforced real-time; don't inflate local simulation
+      startProgressSimulation(gameQuestMode.value === 'cdp' ? 1.0 : speedMultiplier.value)
+      setupListeners()
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : String(e)
+      throw e
+    }
+  }
+
+  async function startStream(questId: string, streamKey: string, secondsNeeded: number, initialProgress: number) {
+    try {
+      const progressPct = (secondsNeeded > 0) ? (initialProgress / secondsNeeded) * 100 : 0
+      await startStreamQuest(questId, streamKey, secondsNeeded, progressPct)
+      activeQuestId.value = questId
+      activeQuestType.value = 'stream'
+      activeQuestProgress.value = progressPct
+      activeQuestTargetDuration.value = secondsNeeded
+
+      startProgressSimulation(1.0)
+      setupListeners()
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : String(e)
+      throw e
+    }
+  }
+
+  async function startPlay(quest: Quest, secondsNeeded: number, initialProgress: number, selectedExeName?: string) {
+    loading.value = true
+    error.value = null
+    // Remember the request so a soft error can offer "switch to CDP and retry".
+    lastPlayRequest.value = { quest, secondsNeeded, initialProgress, selectedExeName }
+    try {
+      // 1. Get Application ID
+      const appId = quest.config.application?.id
+      if (!appId) throw new Error('Quest missing application ID')
+      const appName = quest.config.application?.name || quest.config.messages.game_title || 'Game'
+
+      // Check mode: 'cdp' uses CDP injection, 'heartbeat' uses direct API calls, 'simulate' runs fake game
+      if (gameQuestMode.value === 'cdp') {
+        // CDP mode - inject into Discord client, no game simulation needed
+        console.log(`Starting game quest via CDP for AppID: ${appId}`)
+        const progressPct = (secondsNeeded > 0) ? (initialProgress / secondsNeeded) * 100 : 0
+        await startCdpQuest(
+          quest.id,
+          'play',
+          appId,
+          appName,
+          secondsNeeded,
+          initialProgress,
+          cdpPort.value
+        )
+
+        activeQuestId.value = quest.id
+        activeQuestType.value = 'game'
+        activeQuestProgress.value = progressPct
+        activeQuestTargetDuration.value = secondsNeeded
+
+        startProgressSimulation(1.0)
+        setupListeners()
+
+      } else if (gameQuestMode.value === 'heartbeat') {
+        // [LEGACY] Direct heartbeat mode - no game simulation needed
+        console.log(`Starting game quest via direct heartbeat for AppID: ${appId}`)
+
+        const progressPct = (secondsNeeded > 0) ? (initialProgress / secondsNeeded) * 100 : 0
+        await startGameHeartbeatQuest(
+          quest.id,
+          appId,
+          secondsNeeded,
+          progressPct
+        )
+
+        activeQuestId.value = quest.id
+        activeQuestType.value = 'game'
+        activeQuestProgress.value = progressPct
+        activeQuestTargetDuration.value = secondsNeeded
+
+        startProgressSimulation(1.0)
+
+        // Setup listeners for progress/complete/error events
+        setupListeners()
+
+      } else {
+        // Simulate mode - original behavior
+        // 2. Fetch detectable games to find executable name
+        // Use cached list if available
+        const gamesList = await getDetectableGames()
+        const game = gamesList.find(g => g.id === appId)
+        if (!game) throw new Error(`Game not found in Discord's detectable list (AppID: ${appId})`)
+
+        // Resolve a platform-compatible executable. On Windows/macOS this stays
+        // win32-first; on Linux a native `linux` executable is preferred and a
+        // win32-only game raises a recoverable soft error steering the user to
+        // CDP mode (a Windows binary can't be process-simulated on Linux).
+        // Await rather than reading the ref: capabilities load fire-and-forget
+        // at store creation, and a null descriptor here would fall back to
+        // 'win32' and happily accept a Windows executable on Linux — exactly
+        // the case the soft error below exists to prevent. Resolves instantly
+        // once loaded.
+        const caps = await initPlatformCapabilities()
+        if (!caps) {
+          throw new Error('Unable to determine platform capabilities. Please try again.')
+        }
+        const hostOs = caps.os
+        const resolution = resolveSimulationExecutable(game.executables, hostOs, selectedExeName)
+        if (resolution.kind === 'win32_only_on_linux') {
+          softError.value = {
+            code: 'SIMULATION_EXECUTABLE_OS_UNSUPPORTED',
+            message: `"${game.name}" only provides a Windows executable, which cannot be process-simulated on Linux. Switch to CDP mode to complete this quest.`,
+            gameName: game.name,
+            questId: quest.id,
+            recommendedMode: 'cdp',
+            recoverable: true,
+          }
+          if (isQueueRunning.value) queuePauseReason.value = 'simulation_incompatible'
+          loading.value = false
+          return
+        }
+        if (resolution.kind === 'not_found') {
+          softError.value = {
+            code: 'SIMULATION_EXECUTABLE_NOT_FOUND',
+            message: `No compatible executable definition for game ${game.name}. Switch to CDP mode to complete this quest.`,
+            gameName: game.name,
+            questId: quest.id,
+            recommendedMode: 'cdp',
+            recoverable: true,
+          }
+          if (isQueueRunning.value) queuePauseReason.value = 'simulation_incompatible'
+          loading.value = false
+          return
+        }
+        const exeName = resolution.executable.name
+
+        console.log(`Starting simulated game for ${game.name} (${exeName})...`)
+
+        // 3. Resolve the configured simulation directory once so create and
+        // run always use the same path for this quest.
+        const installPath = await initSimulationPath()
+
+        // 4. Create simulated game executable
+        await createSimulatedGame(installPath, exeName, appId)
+        activeGameExe.value = exeName
+
+        // 5. Run simulated game
+        await runSimulatedGame(game.name, installPath, exeName, appId)
+
+        // 6. Connect RPC
+        const activity = {
+          app_id: appId,
+          state: "In Game",
+          details: `Playing ${game.name}`,
+          largeImageKey: "logo",
+          largeImageText: game.name,
+          timestamp: Date.now()
+        }
+
+        await connectToDiscordRpc(JSON.stringify(activity), 'connect')
+
+        // 7. Update state
+        activeQuestId.value = quest.id
+        activeQuestType.value = 'game'
+        activeQuestProgress.value = (secondsNeeded > 0) ? (initialProgress / secondsNeeded) * 100 : 0
+        activeQuestTargetDuration.value = secondsNeeded
+
+        startProgressSimulation(1.0)
+
+        // Start polling for Play quests (no backend events)
+        setupListeners()
+        startPolling()
+      }
+      try {
+        await startGameSimulationUsage(appId, appName)
+      } catch (historyError) {
+        // A quest must not keep running without its account-scoped history
+        // segment: roll back the started work and fail the start so the UI does
+        // not report success for a simulation that cannot be recorded.
+        await teardownQuestSimulation()
+        const detail = historyError instanceof Error ? historyError.message : String(historyError)
+        throw new Error(`Failed to start game simulation history: ${detail}`)
+      }
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : String(e)
+      // Clean up if started (only for simulate mode)
+      if (activeGameExe.value) {
+        const executable = activeGameExe.value
+        try {
+          await stopSimulatedGame(executable)
+          activeGameExe.value = null
+        } catch (cleanupError) {
+          console.error('Failed to clean up simulated game after start error:', cleanupError)
+        }
+        await emit('event_disconnect').catch(() => undefined)
+      }
+      throw e
+    } finally {
+      loading.value = false
+    }
+  }
+
+  async function startActivity(quest: Quest) {
+    loading.value = true
+    error.value = null
+    try {
+      // Activity quests require CDP mode
+      if (!cdpAvailable.value) {
+        throw new Error('Activity quests require CDP mode. Please start Discord with --remote-debugging-port and enable CDP in Settings.')
+      }
+
+      // Get checkpoint count from task config (default 3)
+      const tasks = quest.config.task_config_v2?.tasks ?? quest.config.task_config?.tasks
+      const activityTaskEntry = tasks ? Object.entries(tasks).find(([key, task]) =>
+        (task.type || key) === 'ACHIEVEMENT_IN_ACTIVITY'
+      ) : null
+      const activityTaskKey = activityTaskEntry?.[0]
+      const activityTask = activityTaskEntry?.[1] ?? null
+      if (!activityTaskEntry || !activityTask) {
+        throw new Error('Quest does not contain a supported checkpoint Activity task')
+      }
+      const checkpointCount = activityTask?.target || 3
+      const currentProgress = quest.user_status?.progress
+      const currentCheckpointValue = activityTaskKey && currentProgress?.[activityTaskKey]?.value != null
+        ? currentProgress[activityTaskKey].value ?? 0
+        : Object.values(currentProgress ?? {})[0]?.value ?? 0
+      const completedCheckpoints = Math.min(
+        checkpointCount,
+        Math.max(0, Math.floor(currentCheckpointValue))
+      )
+      const remainingCheckpointCount = Math.max(0, checkpointCount - completedCheckpoints)
+
+      if (remainingCheckpointCount === 0) {
+        throw new Error('Activity quest already has all checkpoints submitted. Refresh quests or claim the reward in Discord.')
+      }
+
+      // Generate random checkpoint times within [min, max] range
+      const min = activityCheckpointMin.value
+      const max = activityCheckpointMax.value
+      const allCheckpointTimes: number[] = []
+      for (let i = 0; i < checkpointCount; i++) {
+        allCheckpointTimes.push(Math.floor(Math.random() * (max - min + 1)) + min)
+      }
+      const checkpointTimes = allCheckpointTimes.slice(completedCheckpoints)
+      const totalSeconds = allCheckpointTimes.reduce((sum, t) => sum + t, 0)
+      const remainingSeconds = checkpointTimes.reduce((sum, t) => sum + t, 0)
+      const progressPct = checkpointCount > 0 ? (completedCheckpoints / checkpointCount) * 100 : 0
+
+      console.log(`Starting activity quest via CDP: completed=${completedCheckpoints}/${checkpointCount}, remaining=${remainingCheckpointCount}, times=[${checkpointTimes.join(', ')}], remaining=${remainingSeconds}s, estimatedTotal=${totalSeconds}s`)
+
+      const appId = quest.config.application?.id || ''
+      const appName = quest.config.application?.name || quest.config.messages?.quest_name || 'Activity'
+
+      await startCdpQuest(
+        quest.id,
+        'activity',
+        appId,
+        appName,
+        totalSeconds,
+        completedCheckpoints,
+        cdpPort.value,
+        checkpointTimes
+      )
+
+      activeQuestId.value = quest.id
+      activeQuestType.value = 'activity'
+      activeQuestProgress.value = progressPct
+      activeQuestTargetDuration.value = totalSeconds
+
+      startProgressSimulation(1.0)
+      setupListeners()
+
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : String(e)
+      throw e
+    } finally {
+      loading.value = false
+    }
+  }
+
+  async function startPlayActivity(quest: Quest, secondsNeeded: number, initialProgress: number) {
+    loading.value = true
+    error.value = null
+    let preserveActiveState = false
+    try {
+      const appId = quest.config.application?.id
+      if (!appId) throw new Error('Cloud game Activity quest is missing an application ID')
+
+      if (gameQuestMode.value === 'cdp' && !cdpAvailable.value) {
+        throw new Error('CDP mode is selected but Discord CDP is not available')
+      }
+
+      const progressPct = playActivityProgressPercentage(initialProgress, secondsNeeded)
+
+      console.log(
+        `Starting PLAY_ACTIVITY quest: mode=${gameQuestMode.value}, progress=${initialProgress}/${secondsNeeded}s, heartbeat=${heartbeatInterval.value}s, polling=${gamePollingInterval.value}s`
+      )
+
+      activeQuestId.value = quest.id
+      activeQuestType.value = 'activity'
+      activeQuestProgress.value = progressPct
+      activeQuestTargetDuration.value = secondsNeeded
+
+      startProgressSimulation(1.0)
+      setupListeners()
+
+      await startPlayActivityQuest(
+        quest.id,
+        appId,
+        secondsNeeded,
+        initialProgress,
+        gameQuestMode.value,
+        cdpPort.value,
+        heartbeatInterval.value,
+        gamePollingInterval.value
+      )
+      const appName = quest.config.application?.name || quest.config.messages.game_title || 'Activity'
+      try {
+        await startGameSimulationUsage(appId, appName)
+      } catch (historyError) {
+        // Roll back the already-started activity simulation; running it without
+        // an account-scoped history segment would silently break accounting.
+        const detail = historyError instanceof Error ? historyError.message : String(historyError)
+        try {
+          await teardownQuestSimulation()
+        } catch (cleanupError) {
+          preserveActiveState = true
+          const cleanupDetail = cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+          throw new Error(`Failed to start activity simulation history: ${detail}. Cleanup also failed: ${cleanupDetail}`)
+        }
+        throw new Error(`Failed to start activity simulation history: ${detail}`)
+      }
+    } catch (e) {
+      if (!preserveActiveState && activeQuestId.value === quest.id) {
+        activeQuestId.value = null
+        activeQuestType.value = null
+        activeQuestProgress.value = 0
+        activeQuestTargetDuration.value = 0
+        localProgress.value = 0
+        stopProgressSimulation()
+        cleanupListeners()
+      }
+      error.value = e instanceof Error ? e.message : String(e)
+      throw e
+    } finally {
+      loading.value = false
+    }
+  }
+
+  /**
+   * Roll back work started by `startPlay` when a later step fails, without
+   * touching quest state that was never claimed. Used by the history-tracking
+   * failure path, where a process/CDP session and Discord presence may already
+   * be live for a start that is about to report an error.
+   */
+  async function teardownQuestSimulation() {
+    const failures: string[] = []
+    const exeToStop = activeGameExe.value
+    if (gameQuestMode.value === 'simulate' && (exeToStop || activeQuestType.value === 'game')) {
+      if (exeToStop) {
+        try {
+          await stopSimulatedGame(exeToStop)
+          activeGameExe.value = null
+        } catch (cleanupError) {
+          failures.push(cleanupError instanceof Error ? cleanupError.message : String(cleanupError))
+        }
+      }
+      try {
+        await emit('event_disconnect')
+      } catch (cleanupError) {
+        failures.push(cleanupError instanceof Error ? cleanupError.message : String(cleanupError))
+      }
+    }
+    try {
+      await stopQuest()
+    } catch (cleanupError) {
+      failures.push(cleanupError instanceof Error ? cleanupError.message : String(cleanupError))
+    }
+    try {
+      await stopGameSimulationUsage()
+    } catch (cleanupError) {
+      failures.push(cleanupError instanceof Error ? cleanupError.message : String(cleanupError))
+    }
+
+    if (failures.length > 0) throw new Error(failures.join('; '))
+
+    activeQuestId.value = null
+    activeQuestType.value = null
+    activeQuestProgress.value = 0
+    activeQuestTargetDuration.value = 0
+    localProgress.value = 0
+    stopProgressSimulation()
+    cleanupListeners()
+    stopPolling()
+  }
+
+  async function stop() {
+    stopping.value = true
+    console.log('questsStore.stop() called')
+
+    stopProgressSimulation()
+
+    try {
+      // Force Save Logic for Video Quests (skip in CDP mode — progress is server-managed)
+      if (activeQuestId.value && activeQuestType.value === 'video' && activeQuestTargetDuration.value > 0 && gameQuestMode.value !== 'cdp') {
+        try {
+          const currentSeconds = (localProgress.value / 100) * activeQuestTargetDuration.value
+          // Only force if we have significant progress
+          if (currentSeconds > 0) {
+            console.log(`Force submitting video progress: ${currentSeconds.toFixed(1)}s (ID: ${activeQuestId.value})`)
+            await forceVideoProgress(activeQuestId.value, currentSeconds)
+          }
+        } catch (e) {
+          console.error('Failed to force submit progress on stop:', e)
+        }
+      }
+
+      // If manually stopping, ensure queue is also stopped/cleared
+      if (isQueueRunning.value || questQueue.value.length > 0) {
+        isQueueRunning.value = false
+        questQueue.value = [] // Clear queue on manual stop
+      }
+
+      let exeToStop = activeGameExe.value
+
+      // Recovery: If activeGameExe is missing but we have a quest, try to find it
+      // Only applies to simulate mode — CDP/heartbeat modes never create a real process
+      if (!exeToStop && activeQuestId.value && activeQuestType.value === 'game' && gameQuestMode.value === 'simulate') {
+        console.warn('activeGameExe is null, attempting to recover from activeQuestId...')
+        const quest = quests.value.find(q => q.id === activeQuestId.value)
+        if (quest && quest.config.application?.id) {
+          try {
+            const appId = quest.config.application.id
+            const detectableGames = await fetchDetectableGames()
+            const game = detectableGames.find(g => g.id === appId)
+            if (game) {
+              const winExe = game.executables.find(e => e.os === 'win32')
+              if (winExe) {
+                exeToStop = winExe.name
+                console.log('Recovered executable name:', exeToStop)
+              }
+            }
+          } catch (err) {
+            console.error('Failed to recover executable name:', err)
+          }
+        }
+      }
+
+      // Stop simulated game if running (simulate mode only)
+      if (exeToStop && gameQuestMode.value === 'simulate') {
+        try {
+          console.log(`Stopping simulated game: ${exeToStop}`)
+          await stopSimulatedGame(exeToStop)
+          // Disconnect RPC
+          await emit('event_disconnect')
+        } catch (e) {
+          error.value = e instanceof Error ? e.message : String(e)
+          return
+        }
+        activeGameExe.value = null
+      }
+
+      try {
+        await stopQuest()
+      } catch (e) {
+        // Ignore error if no quest running
+      }
+      try {
+        await stopGameSimulationUsage()
+      } catch (historyError) {
+        error.value = historyError instanceof Error ? historyError.message : String(historyError)
+        return
+      }
+
+      activeQuestId.value = null
+      activeQuestType.value = null
+      activeQuestProgress.value = 0
+      activeQuestTargetDuration.value = 0
+      localProgress.value = 0
+
+      cleanupListeners()
+
+      // Refresh quests to get latest status
+      await fetchQuests(true, true)
+
+    } finally {
+      stopping.value = false
+    }
+  }
+
+  function setupListeners() {
+    cleanupListeners()
+
+    console.log('Setting up quest progress listeners...')
+
+    onQuestProgress((progress) => {
+      console.log('Received quest-progress event:', progress)
+      activeQuestProgress.value = progress
+      // For Play quests, update local state or log since no direct feedback loop? 
+      // Discord RPC is one-way, but we might listen to Discord Gateway for activity updates if needed.
+      // But user_status updates come from backend polling or events.
+    }).then((unlisten) => {
+      progressUnlisten = unlisten
+      console.log('Quest progress listener ready')
+    })
+
+    const listenedQuestId = activeQuestId.value
+    onQuestComplete(async () => {
+      console.log('Received quest-complete event')
+      if (stopping.value) return
+      if (!listenedQuestId || activeQuestId.value !== listenedQuestId) return
+
+      // If queue is running, handle transition
+      if (isQueueRunning.value && questQueue.value.length > 0) {
+        await finishQueuedQuest(listenedQuestId)
+      } else {
+        if (completionClaimedFor === listenedQuestId) return
+        completionClaimedFor = listenedQuestId
+        const completedExecutable = activeGameExe.value
+        activeQuestId.value = null
+        try {
+          if (completedExecutable && gameQuestMode.value === 'simulate') {
+            await stopSimulatedGame(completedExecutable)
+            await emit('event_disconnect')
+          }
+          await stopGameSimulationUsage()
+        } catch (cleanupError) {
+          activeQuestId.value = listenedQuestId
+          error.value = cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+          stopProgressSimulation()
+          cleanupListeners()
+          stopPolling()
+          return
+        }
+        // Normal single quest completion
+        activeQuestType.value = null
+        activeQuestProgress.value = 0
+        activeQuestTargetDuration.value = 0
+        activeGameExe.value = null
+        localProgress.value = 0
+        stopProgressSimulation()
+
+        void fetchQuests(true, true)
+        cleanupListeners()
+        stopPolling()
+      }
+    }).then((unlisten) => {
+      completeUnlisten = unlisten
+      console.log('Quest complete listener ready')
+    })
+
+    onQuestError(async (err) => {
+      console.log('Received quest-error event:', err)
+      const failedExecutable = activeGameExe.value
+      if (failedExecutable && gameQuestMode.value === 'simulate') {
+        await stopSimulatedGame(failedExecutable).catch(() => undefined)
+        await emit('event_disconnect').catch(() => undefined)
+      }
+      await stopGameSimulationUsage().catch(() => undefined)
+      error.value = err
+      activeQuestId.value = null
+      activeQuestType.value = null
+      activeQuestProgress.value = 0
+      activeQuestTargetDuration.value = 0
+      activeGameExe.value = null
+      localProgress.value = 0
+      stopProgressSimulation()
+
+      cleanupListeners()
+    }).then((unlisten) => {
+      errorUnlisten = unlisten
+      console.log('Quest error listener ready')
+    })
+  }
+
+  function cleanupListeners() {
+    stopPolling()
+    if (progressUnlisten) {
+      progressUnlisten()
+      progressUnlisten = null
+    }
+    if (completeUnlisten) {
+      completeUnlisten()
+      completeUnlisten = null
+    }
+    if (errorUnlisten) {
+      errorUnlisten()
+      errorUnlisten = null
+    }
+  }
+
+  function setSpeedMultiplier(speed: number) {
+    speedMultiplier.value = speed
+  }
+
+  async function acceptQuestWrapper(questId: string) {
+    try {
+      await acceptQuest(questId)
+      // Optimistic update
+      updateQuestEnrollment(questId, new Date().toISOString())
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : String(e)
+      throw e
+    }
+  }
+
+  async function acceptAllQuests(questIds: string[]) {
+    loading.value = true
+    error.value = null
+    let successCount = 0
+    let failCount = 0
+    try {
+      for (const id of questIds) {
+        try {
+          await acceptQuest(id)
+          updateQuestEnrollment(id, new Date().toISOString())
+          successCount++
+          // Small delay to be nice to API
+          await new Promise(r => setTimeout(r, 500))
+        } catch (e) {
+          console.error(`Failed to accept quest ${id}:`, e)
+          failCount++
+        }
+      }
+    } finally {
+      loading.value = false
+      if (failCount > 0) {
+        error.value = `Accepted ${successCount} quests, failed ${failCount}`
+      }
+    }
+  }
+
+
+  // Refined Complete All Video:
+  // We can't blocking-wait in the UI thread for 15 mins x N quests.
+  // But we can start a "Queue Mode".
+  const questQueue = ref<QueueItem[]>([])
+  const isQueueRunning = ref(false)
+
+  async function processQueue() {
+    if (questQueue.value.length === 0) {
+      isQueueRunning.value = false
+      return
+    }
+
+    isQueueRunning.value = true
+    const queueItem = questQueue.value[0]
+
+    try {
+      console.log(`Queue processing: ${queueItem.id}`)
+
+      // Calculate duration needed
+      let seconds = 0
+      const queueTasks = queueItem.config.task_config_v2?.tasks ?? queueItem.config.task_config?.tasks
+      if (queueTasks) {
+        const taskValues = Object.values(queueTasks)
+        if (taskValues.length > 0) seconds = taskValues[0].target || 0
+      }
+
+      // Check if already partial
+      let progress = 0
+      if (queueItem.user_status?.progress) {
+        const vals = Object.values(queueItem.user_status.progress)
+        if (vals.length > 0) progress = vals[0].value || 0
+      }
+
+      // If completed, skip
+      if (queueItem.user_status?.completed_at) {
+        questQueue.value.shift()
+        processQueue()
+        return
+      }
+
+      // Route by quest type
+      const questKind = getQuestKind(queueItem)
+      console.log(`Queue item type: ${questKind}`)
+
+      if (questKind === 'video') {
+        await startVideo(queueItem.id, seconds, progress)
+      } else {
+        // Game (stream/play) quests — use startPlay with optional pre-selected exe
+        await startPlay(queueItem, seconds, progress, queueItem.selectedExeName)
+      }
+
+      // Now we wait for completion.
+      // Video quests: handled by onQuestComplete event in setupListeners.
+      // Game quests (simulate): handled by polling in checkActiveQuestStatus.
+      // Game quests (CDP/heartbeat): handled by onQuestComplete event.
+
+    } catch (e) {
+      console.error("Queue error:", e)
+      questQueue.value.shift() // Skip failed
+      processQueue()
+    }
+  }
+
+  // We need to modify `onQuestComplete` to trigger next in queue.
+  // See `setupListeners`.
+
+  // --- Detectable Games Caching ---
+  const detectableGames = ref<DetectableGame[]>([])
+  const fetchingGames = ref(false)
+
+  async function getDetectableGames(force = false): Promise<DetectableGame[]> {
+    if (!force && detectableGames.value.length > 0) {
+      console.log('Returning cached detectable games')
+      return detectableGames.value
+    }
+
+    if (fetchingGames.value) {
+      // If already fetching, wait for it (simple poll)
+      while (fetchingGames.value) {
+        await new Promise(r => setTimeout(r, 100))
+      }
+      return detectableGames.value
+    }
+
+    fetchingGames.value = true
+    try {
+      console.log('Fetching detectable games from API...')
+      detectableGames.value = await fetchDetectableGames()
+      console.log(`Fetched ${detectableGames.value.length} detectable games successfully.`)
+      return detectableGames.value
+    } catch (e) {
+      console.error('Failed to fetch detectable games:', e)
+      throw e
+    } finally {
+      fetchingGames.value = false
+    }
+  }
+
+  function resetForLogout() {
+    orbsFetchGeneration++
+    quests.value = []
+    excludedQuests.value = []
+    questEnrollmentBlockedUntil.value = null
+    lastQuestsFetchTime.value = 0
+    loading.value = false
+    error.value = null
+    orbsBalance.value = null
+    orbsBalanceFetchedAt.value = null
+    orbsBalanceLoading.value = false
+    orbsBalanceError.value = null
+    activeQuestId.value = null
+    activeQuestType.value = null
+    activeQuestProgress.value = 0
+    activeQuestTargetDuration.value = 0
+    localProgress.value = 0
+    activeGameExe.value = null
+    questQueue.value = []
+    isQueueRunning.value = false
+    stopping.value = false
+    detectableGames.value = []
+    fetchingGames.value = false
+    cdpAvailable.value = false
+    // Recoverable-error state is per-session: a dialog left open (or a queued
+    // retry) must not reappear against the next account's quests.
+    softError.value = null
+    queuePauseReason.value = null
+    lastPlayRequest.value = null
+    stopProgressSimulation()
+    cleanupListeners()
+    stopPolling()
+  }
+
+  // Check CDP availability and auto-fallback if mode is 'cdp' but CDP isn't reachable
+  async function initCdpMode() {
+    try {
+      const status = await checkCdpStatus(cdpPort.value)
+      cdpAvailable.value = status.connected
+      if (gameQuestMode.value === 'cdp' && !status.connected) {
+        console.warn('CDP mode selected but CDP not available — falling back to simulate mode')
+        gameQuestMode.value = 'simulate'
+      }
+    } catch {
+      cdpAvailable.value = false
+      if (gameQuestMode.value === 'cdp') {
+        console.warn('CDP check failed — falling back to simulate mode')
+        gameQuestMode.value = 'simulate'
+      }
+    }
+  }
+
+  /**
+   * Recover from a recoverable soft error (e.g. a win32-only game on Linux) by
+   * switching to CDP mode and retrying the same quest / resuming the queue.
+   * Falls back to a clear error if CDP can't be reached.
+   */
+  async function switchToCdpAndRetry(): Promise<void> {
+    const req = lastPlayRequest.value
+    gameQuestMode.value = 'cdp'
+
+    // Confirm the CDP port is actually reachable; initCdpMode flips back to
+    // simulate when it isn't, so re-check availability afterward. The soft
+    // error and pause reason are only cleared once CDP is confirmed: dropping
+    // them on a failed check would leave a paused queue reporting "running"
+    // with no active quest and no way to retry from the dialog.
+    await initCdpMode()
+    if (!cdpAvailable.value) {
+      error.value =
+        'CDP mode is not available. Start Discord with CDP enabled (Settings → Discord integration), then try again.'
+      return
+    }
+
+    error.value = null
+    softError.value = null
+    queuePauseReason.value = null
+
+    if (isQueueRunning.value) {
+      await processQueue()
+    } else if (req) {
+      try {
+        await startPlay(req.quest, req.secondsNeeded, req.initialProgress, req.selectedExeName)
+      } catch (error) {
+        // startPlay already records the user-facing error; do not let the
+        // dialog action become an unhandled rejection.
+        console.warn('CDP retry failed:', error)
+      }
+    }
+  }
+
+  /**
+   * Dismiss a soft error without switching modes. If a queue was paused because
+   * the current item is simulation-incompatible, the user's cancel means
+   * "skip it" — drop the head item and continue the queue.
+   */
+  function dismissSoftError(): void {
+    const wasSimIncompatible = queuePauseReason.value === 'simulation_incompatible'
+    softError.value = null
+    queuePauseReason.value = null
+
+    if (wasSimIncompatible && isQueueRunning.value && questQueue.value.length > 0) {
+      questQueue.value.shift()
+      void processQueue()
+    }
+  }
+
+  // Load platform capabilities on store creation so the Linux CDP-first default
+  // and platform-aware executable resolution are ready before any quest runs.
+  // Fire-and-forget; failure is handled inside the action.
+  void initPlatformCapabilities()
+
+  return {
+    quests,
+    excludedQuests,
+    questEnrollmentBlockedUntil,
+    loading,
+    error,
+    orbsBalance,
+    orbsBalanceFetchedAt,
+    orbsBalanceLoading,
+    orbsBalanceError,
+    showOrbsBalance,
+    simulationPath,
+    initSimulationPath,
+    setSimulationPath,
+    resetSimulationPath,
+    activityCheckpointMin,
+    activityCheckpointMax,
+    activeQuestId,
+    activeQuestType,
+    activeQuestProgress,
+    activeQuestTargetDuration,
+    localProgress, // Export local progress
+    speedMultiplier,
+    heartbeatInterval,
+    gamePollingInterval,
+    gameQuestMode,
+    cdpPort,
+    desktopClient,
+    cdpAvailable,
+    stopping,
+    activeGameExe,
+    questQueue, // Export queue
+    isQueueRunning,
+    fetchQuests,
+    fetchOrbsBalance,
+    updateQuestEnrollment,
+    startVideo,
+    startStream,
+    startPlay,
+    startActivity,
+    startPlayActivity,
+    stop,
+    setSpeedMultiplier,
+    acceptQuest: acceptQuestWrapper,
+    acceptAllQuests,
+    // Add to queue logic needs integration with listeners
+    addToQueue: (q: Quest, selectedExeName?: string) => {
+      if (!questQueue.value.find(x => x.id === q.id)) {
+        const item: QueueItem = { ...q, selectedExeName }
+        questQueue.value.push(item)
+      }
+    },
+    startQueue: processQueue,
+    clearQueue: () => {
+      questQueue.value = []
+      isQueueRunning.value = false
+      stop()
+    },
+    // Game Process Caching
+    detectableGames,
+    getDetectableGames,
+    resetForLogout,
+    initCdpMode,
+    // Platform capabilities + Linux soft-error recovery
+    platformCapabilities,
+    platformCapabilitiesReady,
+    initPlatformCapabilities,
+    softError,
+    queuePauseReason,
+    lastPlayRequest,
+    switchToCdpAndRetry,
+    dismissSoftError
+  }
+})
